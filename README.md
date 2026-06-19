@@ -58,4 +58,4 @@ A powerful file and code editor for Home Assistant.
     file_shell:
     ```
 
-
+<a href="https://www.buymeacoffee.com/htmltiger"><img src="https://www.buymeacoffee.com/assets/img/custom_images/white_img.png" alt="Buy Me A Coffee"></a>
