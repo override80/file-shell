@@ -21,6 +21,9 @@ A powerful file and code editor for Home Assistant.
 
 ---
 
+This is an advanced tool and it has the power to delete ANY files. Please remember to back up your data just in case!
+
+---
 ## Screenshots
 
 ![](/screenshot-1.png?raw=true)
