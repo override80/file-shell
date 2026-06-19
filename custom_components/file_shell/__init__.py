@@ -715,18 +715,9 @@ class FileShellApiView(HomeAssistantView, FileShellBase):
 
         def validate():
             if fileext in ("yaml", "yml"):
-                class MyYAML(SafeLoader): pass
-                def anytag(loader, tag, node):
-                    if isinstance(node, yaml.ScalarNode):
-                        return f"<{tag}>"
-                    elif isinstance(node, yaml.SequenceNode):
-                        return loader.construct_sequence(node)
-                    elif isinstance(node, yaml.MappingNode):
-                        return loader.construct_mapping(node)
-                    return f"<{tag}>"
-
-                add_multi_constructor('!', anytag, Loader=MyYAML)
-
+                class MyYAML(yaml.SafeLoader): pass
+                def tagger(r, n): return r.construct_scalar(n)
+                for tag in ['!secret', '!env_var', '!extend', '!input','!include', '!include_dir_list', '!include_dir_named','!include_dir_merge_list', '!include_dir_merge_named', '!lambda' ]: MyYAML.add_constructor(tag, tagger)
                 try:
                     yaml.load(content, Loader=MyYAML)
                     return None
