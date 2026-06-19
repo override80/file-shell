@@ -27,6 +27,8 @@ from homeassistant.components import frontend
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+import voluptuous as vol
 
 NAME = "File Shell"
 DOMAIN = "file_shell"
@@ -34,6 +36,8 @@ DOMAIN_REG = "file_shell_reg"
 CONF_BASE_DIR = "base_dir"
 
 _LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({ vol.Optional(CONF_BASE_DIR, default=""): cv.string})}, extra=vol.ALLOW_EXTRA)
 
 try:
     import pty
