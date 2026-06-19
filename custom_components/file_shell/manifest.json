@@ -3,7 +3,6 @@
   "name": "File Shell",
   "codeowners": ["@junkfix"],
   "config_flow": true,
-  "translation_key": "file_shell",
   "dependencies": ["http", "frontend"],
   "documentation": "https://github.com/junkfix/file-shell",
   "integration_type": "service",
