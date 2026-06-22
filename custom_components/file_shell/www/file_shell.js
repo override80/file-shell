@@ -72,6 +72,7 @@ const app = {
 	favs: 1,
 	uploads: 0,
 	cmd: 0,
+	git: 0,
 	cmenu: 0,
 	dark: false,
 	font: Number(localGet('font')) || 100,
@@ -88,11 +89,12 @@ const els = {
 	term: _id("term"),
 	uploads: _id("uploads"),
 	edit: _id("edit"),
+	git: _id("git"),
 	cmenu: _id("cmenu")
 };
 
 const tabs = {
-	fixed: ['favs', 'files', 'cmd', 'uploads'],
+	fixed: ['favs', 'files', 'cmd', 'uploads', 'git'],
 	list: [],
 	open: 'files',
 	x: {},
@@ -574,6 +576,7 @@ function buildTabs() {
 		['files', d, 'ico-folder'],
 		['cmd', 'Terminal', 'ico-cmd'],
 		['uploads', 'Uploads', 'ico-upload'],
+		['git', 'Source Control', 'git-icon'],
 	].forEach(([id, text, icon]) => {
 		if (!app[id]) { return; }
 		t.appendChild(_ce('div', {title: text?text:'Home', class: 'tab t'+id+ (tabs.open === id ? ' active' : '')},{onclick: () => switchToTab(id)},[
@@ -608,12 +611,16 @@ function switchToTab(tabId) {
 	}
 	if (tabId === 'cmd') {
 		if (!app.term) terminal();
-	}	
+	}
+	if (tabId === 'git') {
+		app.git = 1;
+	}
 	tabs.open = tabId;
 	
 	_qs('body').classList.remove('edit', ...tabs.fixed);
 	if (tabs.fixed.includes(tabId)) {
 		_qs('body').classList.add(tabId);
+		if (tabId === 'git') gitPanel().catch(showError);
 	} else {
 		edit.cm.setState(tabs.x[tabId].cm);
 		
@@ -655,7 +662,13 @@ async function closeTab(id, force=0) {
 		buildTabs();
 		switchToTab('files');
 		return;
-	}	
+	}
+	if (id === 'git') {
+		app.git = 0;
+		buildTabs();
+		switchToTab('files');
+		return;
+	}
 	const t = tabs.x[id];
 	if (!force && t.org !== t.mod && t){
 		popup(_ce('p',0,{textContent:'Close without saving?'}), id.split('/').pop() + ' Changed', {buttons: [
@@ -1802,6 +1815,243 @@ async function _term(){
 }
 
 
+async function apiGit(method, params, body) {
+	const u = apiUrl("/api/file_shell_git", params || {});
+	const isPost = method === 'POST';
+	const hdrs = await authHeaders(isPost ? {"Content-Type": "application/json"} : {});
+	const opts = { method, headers: hdrs };
+	if (isPost && body) opts.body = JSON.stringify(body);
+	let res = await fetch(u, opts);
+	if (res.status === 401) {
+		app.auth = null;
+		opts.headers = await authHeaders(isPost ? {"Content-Type": "application/json"} : {});
+		res = await fetch(u, opts);
+	}
+	return await apiMsg(res);
+}
+
+async function gitPanel() {
+	const el = els.git;
+	el.innerHTML = '<p class="git-empty">Loading…</p>';
+
+	let data;
+	try {
+		data = await apiGit('GET', {action: 'status'});
+	} catch(e) {
+		el.innerHTML = '<p class="git-empty">Git error: ' + escapeHtml(e.message) + '</p>';
+		return;
+	}
+
+	const { branch, files, ahead, behind } = data;
+	el.innerHTML = '';
+
+	const syncTxt = (behind ? '↓' + behind + ' ' : '') + (ahead ? '↑' + ahead : '');
+
+	const header = _ce('div', {class: 'git-header'}, 0, [
+		_ce('span', {class: 'git-branch'}, {textContent: '⎇ ' + branch}),
+		syncTxt ? _ce('span', {class: 'git-sync-info'}, {textContent: syncTxt}) : null,
+		_ce('span', {style: 'flex:1'}),
+		_ce('button', {class: 'git-hbtn', title: 'Pull'}, {textContent: '↓ Pull', onclick: gitPull}),
+		_ce('button', {class: 'git-hbtn', title: 'Push'}, {textContent: '↑ Push', onclick: gitPush}),
+		_ce('button', {class: 'git-hbtn ico-refresh', title: 'Refresh'}, {onclick: () => gitPanel().catch(showError)}),
+		_ce('button', {class: 'git-hbtn', title: 'Log'}, {textContent: '⏱ Log', onclick: gitLog}),
+		_ce('button', {class: 'git-hbtn', title: 'SSH Key Settings'}, {textContent: '⚙', onclick: gitSettings}),
+	]);
+
+	const msgInput = _ce('textarea', {class: 'git-msg', placeholder: 'Commit message (Ctrl+Enter to commit)…'});
+	_on(msgInput, 'keydown', (e) => {
+		if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); gitCommit(msgInput.value); }
+	});
+
+	const commitRow = _ce('div', {class: 'git-commit-row'}, 0, [
+		_ce('button', {class: 'git-commit-btn'}, {textContent: '✓ Commit Staged', onclick: () => gitCommit(msgInput.value)}),
+	]);
+	const commitArea = _ce('div', {class: 'git-commit-area'}, 0, [msgInput, commitRow]);
+
+	const stagedFiles   = files.filter(f => f.x !== ' ' && f.x !== '?');
+	const unstagedFiles = files.filter(f => f.y !== ' ' && f.y !== '?' && !(f.x === '?' && f.y === '?'));
+	const untrackedFiles = files.filter(f => f.x === '?' && f.y === '?');
+
+	const statusClass = (c) => ({M:'git-s-M', A:'git-s-A', D:'git-s-D', R:'git-s-R'}[c] || 'git-s-q');
+
+	const makeFile = (f, statusChar, onStage) => {
+		return _ce('div', {class: 'git-file'}, 0, [
+			_ce('span', {class: 'git-status ' + statusClass(statusChar)}, {textContent: statusChar}),
+			_ce('span', {class: 'git-file-name', title: f.path}, {textContent: f.path, onclick: () => gitDiff(f, onStage.staged)}),
+			_ce('button', {class: 'git-act-btn', title: onStage.label}, {textContent: onStage.symbol, onclick: async (e) => {
+				e.stopPropagation();
+				try {
+					await apiGit('POST', {}, {action: onStage.action, files: [f.path]});
+					gitPanel().catch(showError);
+				} catch(err) { toast(err.message, {theme:'red'}); }
+			}}),
+		]);
+	};
+
+	const buildGroup = (title, items, getOpts) => {
+		if (!items.length) return null;
+		const list = _ce('div', 0, 0, items.map(f => makeFile(f, getOpts(f).char, getOpts(f))));
+		const bulkBtn = _ce('button', {class: 'git-act-btn', title: getOpts(items[0]).bulkLabel}, {textContent: getOpts(items[0]).bulkSymbol, onclick: async () => {
+			try {
+				await apiGit('POST', {}, {action: getOpts(items[0]).action, files: ['.']});
+				gitPanel().catch(showError);
+			} catch(err) { toast(err.message, {theme:'red'}); }
+		}});
+		return _ce('div', {class: 'git-group'}, 0, [
+			_ce('div', {class: 'git-group-hdr'}, 0, [
+				_ce('span', 0, {textContent: title + ' (' + items.length + ')'}),
+				bulkBtn,
+			]),
+			list,
+		]);
+	};
+
+	const stagedOpts   = f => ({char: f.x, staged: true,  action: 'reset', symbol: '−', label: 'Unstage', bulkSymbol: '−', bulkLabel: 'Unstage All'});
+	const changeOpts   = f => ({char: f.y, staged: false, action: 'add',   symbol: '+', label: 'Stage',   bulkSymbol: '+', bulkLabel: 'Stage All'});
+	const untrackedOpts = f => ({char: '?', staged: false, action: 'add',  symbol: '+', label: 'Stage',   bulkSymbol: '+', bulkLabel: 'Stage All'});
+
+	const groups = _ce('div', {class: 'git-groups'});
+	[
+		buildGroup('Staged Changes', stagedFiles, stagedOpts),
+		buildGroup('Changes', unstagedFiles, changeOpts),
+		buildGroup('Untracked Files', untrackedFiles, untrackedOpts),
+	].forEach(g => { if (g) groups.appendChild(g); });
+
+	if (!files.length) {
+		groups.appendChild(_ce('p', {class: 'git-empty'}, {textContent: 'No changes — working tree clean'}));
+	}
+
+	el.appendChild(header);
+	el.appendChild(commitArea);
+	el.appendChild(groups);
+}
+
+async function gitDiff(file, staged) {
+	let data;
+	try {
+		data = await apiGit('GET', {action: 'diff', file: file.path, staged: staged ? '1' : '0'});
+	} catch(e) {
+		toast('Diff error: ' + e.message, {theme: 'red'});
+		return;
+	}
+	const diff = data.diff || '';
+	if (!diff.trim()) { toast('No diff available for ' + file.path); return; }
+
+	const pre = _ce('pre', {class: 'git-diff'});
+	diff.split('\n').forEach(line => {
+		const span = _ce('span', {class: 'diff-line'});
+		if      (line.startsWith('+') && !line.startsWith('+++')) span.classList.add('diff-add');
+		else if (line.startsWith('-') && !line.startsWith('---')) span.classList.add('diff-del');
+		else if (line.startsWith('@@'))                           span.classList.add('diff-hunk');
+		else if (/^(diff |index |--- |\+\+\+ )/.test(line))      span.classList.add('diff-meta');
+		span.textContent = line;
+		pre.appendChild(span);
+	});
+
+	const wrap = _ce('div', {style: 'overflow: auto; max-height: 65vh; max-width: 100%'}, 0, [pre]);
+	const pp = popup(wrap, (staged ? '[staged] ' : '') + file.path, {buttons: [{text: 'Close', key: 'Escape'}]});
+	pp.el.querySelector('#popbox').style.maxWidth = '820px';
+}
+
+async function gitCommit(message) {
+	message = (message || '').trim();
+	if (!message) { toast('Enter a commit message first', {theme: 'red'}); return; }
+	try {
+		const d = await apiGit('POST', {}, {action: 'commit', message});
+		toast('Committed: ' + (d.output || '').split('\n')[0]);
+		gitPanel().catch(showError);
+	} catch(e) {
+		toast('Commit failed: ' + e.message, {theme: 'red', timeout: 0, close: 1});
+	}
+}
+
+async function gitPull() {
+	const t = toast('Pulling…', {timeout: 0, theme: 'black'});
+	try {
+		const d = await apiGit('POST', {}, {action: 'pull'});
+		t.dismiss();
+		toast('Pull: ' + (d.output || 'Already up to date'));
+		gitPanel().catch(showError);
+	} catch(e) {
+		t.dismiss();
+		toast('Pull failed: ' + e.message, {theme: 'red', timeout: 0, close: 1});
+	}
+}
+
+async function gitPush() {
+	const t = toast('Pushing…', {timeout: 0, theme: 'black'});
+	try {
+		const d = await apiGit('POST', {}, {action: 'push'});
+		t.dismiss();
+		toast('Push: ' + (d.output || 'Done'));
+		gitPanel().catch(showError);
+	} catch(e) {
+		t.dismiss();
+		toast('Push failed: ' + e.message, {theme: 'red', timeout: 0, close: 1});
+	}
+}
+
+async function gitSettings() {
+	let data;
+	try { data = await apiGit('GET', {action: 'ssh_keys'}); }
+	catch(e) { toast('Error: ' + e.message, {theme: 'red'}); return; }
+
+	const { keys, current } = data;
+	const input = _ce('input', {type: 'text', style: 'width:100%', placeholder: 'Auto-detect (leave empty for default)'});
+	input.value = current || '';
+
+	const keyList = _ce('div', {class: 'pick-list'});
+	const noneItem = _ce('div', {class: 'pick-item' + (!current ? ' rclick' : '')}, {
+		onclick: () => { input.value = ''; _qsa('.pick-item', keyList).forEach(i => i.classList.remove('rclick')); noneItem.classList.add('rclick'); }
+	}, [_ce('i', {class: 'ico-x', style: 'opacity:.5'}), _ce('span', 0, {textContent: ' Auto-detect'})]);
+	keyList.appendChild(noneItem);
+
+	keys.forEach(k => {
+		const item = _ce('div', {class: 'pick-item' + (k === current ? ' rclick' : '')}, {
+			onclick: () => {
+				input.value = k;
+				_qsa('.pick-item', keyList).forEach(i => i.classList.remove('rclick'));
+				item.classList.add('rclick');
+			}
+		}, [_ce('i', {class: 'ico-link'}), _ce('span', 0, {textContent: ' ' + k})]);
+		keyList.appendChild(item);
+	});
+	if (!keys.length) {
+		keyList.appendChild(_ce('div', {class: 'muted', style: 'padding:8px'}, {textContent: 'No SSH keys found in /config/ssh, /share, /media'}));
+	}
+
+	const body = _ce('div', 0, 0, [
+		_ce('p', {class: 'muted', style: 'margin:0 0 6px'}, {textContent: 'Choose an SSH private key for git operations:'}),
+		keyList,
+		_ce('p', {style: 'margin:10px 0 4px'}, {textContent: 'Custom path:'}),
+		input,
+	]);
+
+	popup(body, '⚙ Git SSH Key', {buttons: [
+		{text: 'Cancel', key: 'Escape'},
+		{text: 'Save', key: 'Enter', def: 1, click: async (html, pp) => {
+			try {
+				await apiGit('POST', {}, {action: 'git_config', ssh_key: input.value.trim()});
+				toast('SSH key saved');
+				return true;
+			} catch(e) {
+				_qs('cite', html).textContent = e.message;
+				return false;
+			}
+		}},
+	]});
+}
+
+async function gitLog() {
+	let data;
+	try { data = await apiGit('GET', {action: 'log'}); }
+	catch(e) { toast('Log error: ' + e.message, {theme: 'red'}); return; }
+	const wrap = _ce('div', {style: 'overflow: auto; max-height: 65vh'}, 0,
+		[_ce('pre', {class: 'git-log'}, {textContent: data.log || '(no commits)'})]
+	);
+	const pp = popup(wrap, 'Git Log', {buttons: [{text: 'Close', key: 'Escape'}]});
+	pp.el.querySelector('#popbox').style.maxWidth = '700px';
+}
 
 
 async function uploadui(hide){
@@ -2037,6 +2287,7 @@ async function init() {
 			_ce('button',{title:'New File', class: 'ico-newfile'},{onclick: ()=>{createNewFile();}}),
 			_ce('button',{title:'New Folder', class: 'ico-newdir'},{onclick: ()=>{createFolder();}}),
 			_ce('button', { title: 'Terminal', class: 'ico-cmd' }, {onclick: _ => switchToTab('cmd')}),
+			_ce('button', { title: 'Source Control', class: 'git-icon' }, {onclick: _ => switchToTab('git')}),
 		]),
 		_ce('div',{class:'group', id: 'toolbar_edit'},0,[
 			_ce('button',{title: "Save", class:"ico-save"}, {onclick: ()=>{saveTextFile();}}),

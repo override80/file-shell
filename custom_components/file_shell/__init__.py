@@ -93,6 +93,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(FileShellApiView(hass, entry))
     hass.http.register_view(FileShellStreamView(hass, entry))
     hass.http.register_view(FileShellTerminalView(hass, entry))
+    hass.http.register_view(FileShellGitView(hass, entry))
     entry.async_on_unload(entry.add_update_listener(async_update_options))
     store = Store(hass, version=1, key=DOMAIN_OPT)
     hass.data[DOMAIN_OPT] = store
@@ -268,7 +269,7 @@ class FileShellBase:
         return False
 
     async def _storage(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        default = {"wrap": True, "bulb": False, "space": False, "favs": {}, "recentmax": 10, "recentlist": []}
+        default = {"wrap": True, "bulb": False, "space": False, "favs": {}, "recentmax": 10, "recentlist": [], "git_ssh_key": ""}
         if not (store := self.hass.data.get(DOMAIN_OPT)):
             _LOGGER.warning("Settings not initialized")
             return default
@@ -996,3 +997,202 @@ class FileShellTerminalView(HomeAssistantView, FileShellBase):
                     await ws.close()
 
         return ws
+
+
+class FileShellGitView(HomeAssistantView, FileShellBase):
+    url = "/api/file_shell_git"
+    name = "api:file_shell_git"
+    requires_auth = False
+
+    async def _make_env(self) -> dict:
+        env = os.environ.copy()
+        config = await self._storage()
+        key_path = config.get("git_ssh_key", "").strip()
+        if not key_path:
+            default_key = self.base_dir / "ssh" / "id_rsa"
+            if default_key.exists():
+                key_path = str(default_key)
+        if key_path:
+            env["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o StrictHostKeyChecking=no -o BatchMode=yes"
+        return env
+
+    def _run_git(self, *args: str, timeout: int = 30, env: dict | None = None) -> tuple[str, str, int]:
+        result = subprocess.run(
+            ["git", "-C", str(self.base_dir), *args],
+            capture_output=True,
+            text=True,
+            env=env or os.environ.copy(),
+            timeout=timeout,
+        )
+        return result.stdout, result.stderr, result.returncode
+
+    async def _git(self, *args: str, timeout: int = 30) -> tuple[str, str, int]:
+        env = await self._make_env()
+        return await self.hass.async_add_executor_job(
+            lambda: self._run_git(*args, timeout=timeout, env=env)
+        )
+
+    async def get(self, request: web.Request) -> web.Response:
+        if not self._admin_user(request):
+            return json_error("Admin privileges required", 403)
+        action = request.query.get("action", "")
+        if action == "status":
+            return await self._status()
+        if action == "diff":
+            return await self._diff(request)
+        if action == "log":
+            return await self._log()
+        if action == "ssh_keys":
+            return await self._list_ssh_keys()
+        return json_error(f"Unknown action: {action}", 400)
+
+    async def post(self, request: web.Request) -> web.Response:
+        if not self._admin_user(request):
+            return json_error("Admin privileges required", 403)
+        data = await self.read_json(request)
+        action = data.get("action", "")
+        if action == "add":
+            return await self._add(data)
+        if action == "reset":
+            return await self._reset(data)
+        if action == "commit":
+            return await self._commit(data)
+        if action == "pull":
+            return await self._pull()
+        if action == "push":
+            return await self._push()
+        if action == "git_config":
+            return await self._git_config_set(data)
+        return json_error(f"Unknown action: {action}", 400)
+
+    async def _status(self) -> web.Response:
+        stdout, stderr, code = await self._git("status", "--porcelain=v1", "-u")
+        if code != 0:
+            return json_error(stderr.strip() or "git status failed", 500)
+
+        branch_out, _, _ = await self._git("branch", "--show-current")
+        branch = branch_out.strip() or "HEAD"
+
+        ahead = behind = 0
+        rev_out, _, rev_code = await self._git("rev-list", "--left-right", "--count", "@{u}...HEAD")
+        if rev_code == 0:
+            parts = rev_out.strip().split()
+            if len(parts) == 2:
+                try:
+                    behind, ahead = int(parts[0]), int(parts[1])
+                except ValueError:
+                    pass
+
+        files = []
+        for line in stdout.splitlines():
+            if len(line) < 4:
+                continue
+            x, y = line[0], line[1]
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            files.append({"x": x, "y": y, "path": path})
+
+        return json_ok(branch=branch, files=files, ahead=ahead, behind=behind)
+
+    async def _diff(self, request: web.Request) -> web.Response:
+        file_path = request.query.get("file", "")
+        staged = request.query.get("staged", "0") == "1"
+        args = ["diff", "--no-color"]
+        if staged:
+            args.append("--cached")
+        if file_path:
+            args += ["--", file_path]
+        stdout, stderr, code = await self._git(*args)
+        if code > 1:
+            return json_error(stderr.strip() or "git diff failed", 500)
+        return json_ok(diff=stdout)
+
+    async def _log(self) -> web.Response:
+        stdout, stderr, code = await self._git("log", "--oneline", "--decorate", "--graph", "-30")
+        if code != 0:
+            return json_error(stderr.strip() or "git log failed", 500)
+        return json_ok(log=stdout)
+
+    async def _add(self, data: dict) -> web.Response:
+        files = data.get("files", [])
+        if not files:
+            return json_error("No files specified", 400)
+        _, stderr, code = await self._git("add", "--", *files)
+        if code != 0:
+            return json_error(stderr.strip() or "git add failed", 500)
+        return json_ok()
+
+    async def _reset(self, data: dict) -> web.Response:
+        files = data.get("files", [])
+        if not files:
+            return json_error("No files specified", 400)
+        _, stderr, code = await self._git("restore", "--staged", "--", *files)
+        if code != 0:
+            return json_error(stderr.strip() or "git restore failed", 500)
+        return json_ok()
+
+    async def _commit(self, data: dict) -> web.Response:
+        message = str(data.get("message", "")).strip()
+        if not message:
+            return json_error("Commit message is required", 400)
+        stdout, stderr, code = await self._git("commit", "-m", message)
+        if code != 0:
+            return json_error(stderr.strip() or stdout.strip() or "git commit failed", 500)
+        return json_ok(output=stdout.strip())
+
+    async def _list_ssh_keys(self) -> web.Response:
+        search_dirs = [
+            Path("/config/ssh"),
+            Path("/config/.ssh"),
+            self.base_dir / "ssh",
+            self.base_dir / ".ssh",
+            Path("/share"),
+            Path("/media"),
+            Path("/root/.ssh"),
+        ]
+        key_stems = {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "id_ecdsa_sk", "id_ed25519_sk"}
+
+        def scan() -> list[str]:
+            found: list[str] = []
+            seen: set[str] = set()
+            for d in search_dirs:
+                try:
+                    if not d.is_dir():
+                        continue
+                    for f in sorted(d.iterdir()):
+                        p = str(f.resolve())
+                        if p in seen or not f.is_file():
+                            continue
+                        name = f.name
+                        if name.endswith(".pub"):
+                            continue
+                        if name in key_stems or (name.startswith("id_") and "." not in name):
+                            found.append(p)
+                            seen.add(p)
+                except (PermissionError, OSError):
+                    pass
+            return found
+
+        keys = await self._run(scan)
+        config = await self._storage()
+        return json_ok(keys=keys, current=config.get("git_ssh_key", ""))
+
+    async def _git_config_set(self, data: dict) -> web.Response:
+        ssh_key = str(data.get("ssh_key", "")).strip()
+        if ssh_key and not Path(ssh_key).exists():
+            return json_error("SSH key file not found", 400)
+        await self._storage({"git_ssh_key": ssh_key})
+        return json_ok()
+
+    async def _pull(self) -> web.Response:
+        stdout, stderr, code = await self._git("pull", timeout=60)
+        if code != 0:
+            return json_error((stderr + stdout).strip() or "git pull failed", 500)
+        return json_ok(output=(stdout + stderr).strip())
+
+    async def _push(self) -> web.Response:
+        stdout, stderr, code = await self._git("push", timeout=60)
+        if code != 0:
+            return json_error((stderr + stdout).strip() or "git push failed", 500)
+        return json_ok(output=(stdout + stderr).strip())
